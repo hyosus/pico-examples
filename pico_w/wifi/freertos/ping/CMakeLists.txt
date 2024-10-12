@@ -37,10 +37,13 @@ if (EXISTS ${PICO_LWIP_CONTRIB_PATH}/apps/ping/ping.c)
             ${PICO_LWIP_CONTRIB_PATH}/apps/ping
             )
     target_link_libraries(picow_freertos_ping_sys
+        hardware_adc
             pico_cyw43_arch_lwip_sys_freertos
             pico_stdlib
             pico_lwip_iperf
             FreeRTOS-Kernel-Heap4 # FreeRTOS kernel and dynamic heap
             )
     pico_add_extra_outputs(picow_freertos_ping_sys)
+
+    pico_enable_stdio_usb(picow_freertos_ping_sys 1)
 endif()
