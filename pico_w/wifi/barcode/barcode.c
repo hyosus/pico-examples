@@ -1,20 +1,20 @@
+
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
 #include "pico/time.h"
 #include <stdbool.h>
-
 // GPIO Definitions
 #define ADC_PIN 26 // GPIO 26 (ADC0)
-
+#define DIGI_PIN 0
 // Thresholds and Timing
-#define THRESHOLD 1800        // ADC midpoint (0-4095 for 12-bit ADC)
-#define MAX_ELEMENTS 9        // Each character in the barcode has 9 elements (5 bars and 4 spaces)
+#define THRESHOLD 1000        // ADC midpoint (0-4095 for 12-bit ADC)
+#define MAX_ELEMENTS 27       // Each character in the barcode has 9 elements (5 bars and 4 spaces)
 #define MAX_BARCODE_LENGTH 90 // Maximum barcode length (10 characters)
+#define DEBOUNCE_TIME_US 500  // Debounce time in us
+#define SAMPLE_SIZE 200
 
-char decoded_barcode[MAX_BARCODE_LENGTH];
-int decoded_length = 0;
 bool scanning_completed = false;
 
 // Element Structure. Each scanned element is classified as either a bar or a space.
@@ -28,13 +28,10 @@ typedef struct
 Element elements[MAX_ELEMENTS];
 int element_count = 0;
 
-// Function to initialize ADC
-void init_adc_sensor()
-{
-    adc_init();
-    adc_gpio_init(ADC_PIN);
-    adc_select_input(0); // ADC0
-}
+int element_widths[MAX_ELEMENTS];
+
+uint16_t ADC_values[SAMPLE_SIZE];
+uint16_t HIGH_THRESHOLD, LOW_THRESHOLD;
 
 // Code 39 Patterns and Characters
 typedef struct
@@ -88,8 +85,15 @@ const Code39Mapping code39_mappings[] = {
     {{0, 0, 0, 1, 0, 0, 1, 0, 1}, '7'},
     {{1, 0, 0, 1, 0, 0, 1, 0, 0}, '8'},
     {{0, 0, 1, 1, 0, 0, 1, 0, 0}, '9'}};
-
 const int num_mappings = sizeof(code39_mappings) / sizeof(code39_mappings[0]);
+
+// Function to initialize ADC
+void init_adc_sensor()
+{
+    adc_init();
+    adc_gpio_init(ADC_PIN);
+    adc_select_input(0); // ADC0
+}
 
 // Function that compares a group of 9 elements against all mappings to find a matching character.
 char decode_character(Element *elements_group)
@@ -100,7 +104,6 @@ char decode_character(Element *elements_group)
     {
         temp_pattern[i] = elements_group[i].is_wide ? 1 : 0;
     }
-
     // Compare with each mapping
     for (int i = 0; i < num_mappings; i++)
     {
@@ -120,13 +123,11 @@ char decode_character(Element *elements_group)
     }
     return '?'; // Return '?' if no match is found
 }
-
 // Function to classify elements as narrow or wide
 void classify_elements(Element *elements, int count)
 {
     // Find the shortest
     float min_duration = elements[0].duration_ms;
-
     for (int i = 1; i < count; i++)
     {
         if (elements[i].duration_ms < min_duration)
@@ -134,7 +135,6 @@ void classify_elements(Element *elements, int count)
             min_duration = elements[i].duration_ms; // shortest duration
         }
     }
-
     // Classify elements based on the shortest duration
     for (int i = 0; i < count; i++)
     {
@@ -149,53 +149,118 @@ void classify_elements(Element *elements, int count)
     }
 }
 
-// Function to measure pulse widths and storing them in an array to later classify them as narrow or wide. Short duration would classify as narrow and long duration would classify as wide.
-void measure_pulse_width(uint gpio_pin)
+void measure_pulse_width_adc(uint adc_pin)
 {
     uint32_t start_time, end_time;
-    uint32_t pulse_width = 0;
-
-    // Detect initial state at startup
-    bool initial_state = gpio_get(gpio_pin);
-
-    // Start timer when we see a transition
-    if (initial_state)
+    uint32_t active_pulse_width = 0, inactive_pulse_width = 0;
+    // Initialize ADC
+    adc_init();
+    adc_gpio_init(adc_pin);
+    adc_select_input(0);
+    // Detect initial state (active or inactive) at startup
+    uint16_t initial_value = adc_read();
+    bool initial_state = initial_value > THRESHOLD; // 1 for HIGH (dark), 0 for LOW (white)
+    // Start timer when we see a transition from inactive to active
+    if (!initial_state)
     {
         start_time = time_us_32();
     }
-
-    // Keep track of the number of transitions
-    int transitions = 0;
-
-    while (transitions < MAX_ELEMENTS * 2) // Wait for 18 transitions (9 elements * 2 states per element)
+    while (element_count < MAX_ELEMENTS) // Wait for 9 elements
     {
-        bool current_state = gpio_get(gpio_pin);
-
+        uint16_t current_value = adc_read();
+        bool current_state = current_value > THRESHOLD;
+        // Debounce logic: check if there’s a transition
         if (current_state != initial_state)
         {
-            // Transition detected
-            if (start_time != 0)
+            sleep_us(DEBOUNCE_TIME_US); // Apply debounce delay
+            // Re-check after debounce delay to confirm the state
+            current_value = adc_read();
+            current_state = current_value > THRESHOLD;
+            // Confirm transition if the state is still different
+            if (current_state != initial_state)
             {
-                end_time = time_us_32();
-                pulse_width = end_time - start_time;
-
-                printf("Pulse width: %d us\n", pulse_width);
-
-                // Store the timing in the array
-                elements[element_count].duration_ms = pulse_width / 1000.0f; // Convert to milliseconds
-
-                element_count++;
-
-                if (element_count >= MAX_ELEMENTS)
+                if (start_time != 0)
                 {
-                    element_count = 0; // Reset the counter if we reach the maximum
+                    end_time = time_us_32();
+                    uint32_t pulse_width = end_time - start_time;
+                    if (current_state == false)
+                    {
+                        printf("Active pulse: %f ms\n", pulse_width / 1000.0f);
+                        active_pulse_width += pulse_width;
+                        elements[element_count].duration_ms = pulse_width / 1000.0f;
+                        element_count++;
+                    }
+                    else // Even number of transitions means it's an inactive pulse
+                    {
+                        printf("Inactive pulse: %f ms\n", pulse_width / 1000.0f);
+                        inactive_pulse_width += pulse_width;
+                        elements[element_count].duration_ms = pulse_width / 1000.0f;
+                        element_count++;
+                    }
                 }
+                start_time = time_us_32();
+                initial_state = current_state;
             }
+        }
+    }
+}
 
-            // Reset timer and initial state
-            start_time = time_us_32();
-            transitions++;
-            initial_state = !initial_state;
+void collect_data()
+{
+    for (int i = 0; i < SAMPLE_SIZE; i++)
+    {
+        adc_select_input(0);
+        uint16_t sensor_value = adc_read();
+        ADC_values[i] = sensor_value;
+        printf("Sensor value: %d\n", sensor_value);
+        sleep_ms(100);
+    }
+}
+
+void find_threshold()
+{
+    uint16_t max = 0;
+    uint16_t min = 4095;
+
+    for (int i = 0; i < SAMPLE_SIZE; i++)
+    {
+        if (ADC_values[i] > max)
+        {
+            max = ADC_values[i];
+        }
+        if (ADC_values[i] < min)
+        {
+            min = ADC_values[i];
+        }
+    }
+
+    HIGH_THRESHOLD = max * 0.72; // 72% of max value
+    LOW_THRESHOLD = min * 1.2;   // 120% of min value
+}
+
+void find_width()
+{
+    int high_count = 0;
+    int element_count = 0;
+
+    for (int i = 0; i < SAMPLE_SIZE; i++)
+    {
+        if (ADC_values[i] >= HIGH_THRESHOLD)
+        {
+            high_count++;
+            printf("Count: %d\n", high_count);
+            for (int j = i + 1; j < SAMPLE_SIZE; j++)
+            {
+                if (ADC_values[j] <= HIGH_THRESHOLD)
+                {
+                    element_widths[element_count] = high_count; // Store width of HIGH pulse
+                    element_count++;
+                    break;
+                }
+                high_count++;
+                printf("YOUR MOTHER: %d\n", high_count);
+            }
+            high_count = 0; // Reset counter
         }
     }
 }
@@ -204,62 +269,62 @@ int main()
 {
     // Initialize standard IO
     stdio_init_all();
-
     // Initialize ADC
     init_adc_sensor();
-
     printf("Scanning for barcodes...\n");
 
-    // Initialize timing
-    absolute_time_t last_transition_time = get_absolute_time();
-    bool previous_state = true;    // Starting outside the barcode
     bool scanning_started = false; // Flag to indicate if scanning has started
+    bool initial_state = false;    // Assume initial state is on white space
 
     while (1)
     {
-        // Read sensor
-        uint16_t sensor_value = adc_read();
-        printf("Sensor Value: %d\n", sensor_value);
+        // Read sensor value
+        collect_data();
+        find_threshold();
+        printf("High threshold: %d, Low threshold: %d\n", HIGH_THRESHOLD, LOW_THRESHOLD);
 
-        // Check for barcode start
-        if (!scanning_started && sensor_value > THRESHOLD)
+        find_width();
+
+        for (int i = 0; i < MAX_ELEMENTS; i++)
         {
-            scanning_started = true;
-            printf("Barcode scanning started!\n");
-            scanning_completed = false;
-            element_count = 0;
+            printf("Element %d: %d width\n", i, element_widths[i]);
         }
 
-        if (scanning_started)
-        {
-            // Measure pulse widths
-            measure_pulse_width(ADC_PIN);
+        sleep_ms(5000);
 
-            // Wait until scanning is completed
-            while (!scanning_completed)
-            {
-                tight_loop_contents();
-            }
-
-            // Classify elements
-            classify_elements(elements, element_count);
-
-            // Decode character
-            char decoded_char = decode_character(elements);
-            printf("Decoded character: %c\n", decoded_char);
-
-            // Reset for next character
-            element_count = 0;
-            scanning_completed = false;
-
-            // Check if we've reached the end of the barcode
-            if (decoded_char == '*')
-            { //'*' marks the end of the barcode
-                printf("Barcode scan completed.\n");
-                scanning_started = false;
-            }
-        }
+        // if (!scanning_started && sensor_value > THRESHOLD)
+        // {
+        //     scanning_started = true;
+        //     printf("Barcode scanning started!\n");
+        //     scanning_completed = false;
+        //     element_count = 0;
+        // }
+        // if (scanning_started)
+        // {
+        //     // Measure pulse widths
+        //     measure_pulse_width_adc(ADC_PIN);
+        //     scanning_completed = true;
+        //     // Wait until scanning is completed
+        //     while (!scanning_completed)
+        //     {
+        //         tight_loop_contents();
+        //     }
+        //     printf("Scanning completed.");
+        //     // Classify elements
+        //     classify_elements(elements, element_count);
+        //     // Decode character
+        //     char decoded_char = decode_character(elements);
+        //     printf("Decoded character: %c\n", decoded_char);
+        //     // Reset for next character
+        //     element_count = 0;
+        //     scanning_completed = false;
+        //     // Check if we've reached the end of the barcode
+        //     if (decoded_char == '*')
+        //     { //'*' marks the end of the barcode
+        //         printf("Barcode scan completed.\n");
+        //         scanning_started = false;
+        //     }
+        // }
     }
-
     return 0;
 }
