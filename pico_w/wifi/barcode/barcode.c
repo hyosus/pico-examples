@@ -29,6 +29,7 @@ typedef struct
 
 // Array to store elements
 Element elements[MAX_ELEMENTS];
+Element reversed_elements[MAX_ELEMENTS];
 int element_count = 0;
 
 uint16_t ADC_values[SAMPLE_SIZE];
@@ -168,6 +169,14 @@ int hamming_distance(const int *pattern1, const int *pattern2, int length)
         }
     }
     return distance;
+}
+
+void reverse_array(Element *original, int total_elements)
+{
+    for (int i = 0; i < total_elements; i++)
+    {
+        reversed_elements[i] = original[total_elements - i - 1];
+    }
 }
 
 void collect_data()
@@ -321,6 +330,7 @@ void decode_elements(Element *elements, int total_elements)
 
     int element_index = 0;
     int char_count = 0;
+    char decoded_chars[3];
 
     // Loop through elements and decode each 9-element group
     while (element_index + 9 <= total_elements) // Ensure enough elements remain
@@ -333,14 +343,22 @@ void decode_elements(Element *elements, int total_elements)
         }
 
         // Decode the character using the elements_group and code39_mappings
-        char decoded_char = decode_character(elements_group);
-        printf("Decoded Character %d: %c\n", ++char_count, decoded_char);
+        decoded_chars[char_count] = decode_character(elements_group);
+        printf("Decoded Character %d: %c\n", char_count + 1, decoded_chars[char_count]);
+        char_count++;
 
         // If a separator follows, skip it
         if (element_index < total_elements && elements[element_index].is_wide == 0)
         {
             element_index++;
         }
+    }
+
+    // If first decoded char is not "*", reverse the array and decode again
+    if (decoded_chars[0] != '*')
+    {
+        reverse_array(elements, total_elements);
+        decode_elements(reversed_elements, total_elements);
     }
 }
 
@@ -379,9 +397,15 @@ int main()
 
             decode_elements(elements, element_count);
 
+            printf("==== Original Array ====\n");
             for (int i = 0; i < element_count; i++)
             {
                 printf("Element %d: %d | %d width\n", i + 1, elements[i].is_wide, elements[i].width);
+            }
+            printf("==== Reversed Array ====\n");
+            for (int i = 0; i < element_count; i++)
+            {
+                printf("Element %d: %d | %d width\n", i + 1, reversed_elements[i].is_wide, reversed_elements[i].width);
             }
 
             scanning_complete = false; // Reset after completing processing
